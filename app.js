@@ -616,6 +616,10 @@ class VideoPlayerManager {
 
     // Create new Video.js player with HLS support
     console.log('[PLAYER] Creating new player');
+    
+    // Detect Safari - use native HLS for better stability
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    console.log('[PLAYER] isSafari', isSafari);
     this.player = videojs('videoPlayer', {
       controls: true,
       preload: 'auto',
@@ -623,13 +627,33 @@ class VideoPlayerManager {
       fluid: true,
       html5: {
         vhs: {
-          overrideNative: true  // Use Video.js HLS implementation
-        }
+          overrideNative: !isSafari  // Use native HLS on Safari, VHS on other browsers
+        },
+        nativeAudioTracks: isSafari,
+        nativeVideoTracks: isSafari
       }
     });
 
     // Load HLS stream
     this.player.src({ src: contentUrl, type: 'application/x-mpegURL' });
+    
+    // Safari needs explicit load() call for proper HLS initialization
+    if (isSafari) {
+      this.player.load();
+    }
+    
+    // Add error recovery for Safari
+    this.player.on('error', () => {
+      const error = this.player.error();
+      if (error && error.code === 3) {
+        console.warn('[PLAYER] MEDIA_ERR_DECODE detected, attempting recovery');
+        // Attempt to recover by reloading from current position
+        const currentTime = this.player.currentTime();
+        this.player.load();
+        this.player.currentTime(currentTime);
+        this.player.play().catch(err => console.error('[PLAYER] Recovery play failed:', err));
+      }
+    });
   }
 
   /**
