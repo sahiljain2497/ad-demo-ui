@@ -1,0 +1,24 @@
+{
+  "name": "ad-demo",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "build": "esbuild app.js --bundle --outfile=dist/app.js --format=iife",
+    "dev": "npm run build && live-server",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@dailymotion/vmap": "^3.3.3",
+    "@dailymotion/vast-client": "^6.4.2",
+    "video.js": "^8.10.0",
+    "videojs-markers": "^1.0.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.19.0",
+    "live-server": "^1.2.2"
+  }
+}
