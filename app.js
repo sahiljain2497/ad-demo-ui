@@ -29,9 +29,6 @@ const videojs = window.videojs;
 /** Interval (in seconds) between ad breaks for VMAP generation */
 const VMAP_INTERVAL = 300;
 
-/** Tolerance (in seconds) for triggering ad breaks near target times */
-const AD_TRIGGER_TOLERANCE = 0.5;
-
 // =============================================================================
 // GLOBAL STATE
 // =============================================================================
@@ -54,11 +51,11 @@ let currentAd = null;
 /** VAST tracker for the current ad (tracks impressions, clicks, etc.) */
 let vastTracker = null;
 
-/** Index of the last triggered ad break (prevents re-triggering) */
-let lastTriggeredBreakIndex = -1;
+/** Flag indicating if currently in an ad break (for MediaTailor) */
+let isInAdBreak = false;
 
-/** Current playback time of the ad (used for tracking) */
-let adPlaybackStartTime = 0;
+/** Current ad break being played (for MediaTailor tracking) */
+let currentAdBreak = null;
 
 // =============================================================================
 // VMAP/VAST UTILITIES
@@ -147,6 +144,8 @@ function buildAdBreakList(vmap, contentDurationSec) {
         timeInSeconds: seconds,
         breakId: br.breakId || `break_${i}`,
         vastUrl: vastUrl,
+        duration: 30, // Default, will be updated from VAST response
+        skipOffset: 5, // Default, will be updated from VAST response
       });
     }
   }
@@ -237,10 +236,21 @@ function initMarkers() {
   // Only show markers for mid-roll ads (not pre/post-roll)
   const markers = adBreaks
     .filter((br) => br.timeInSeconds > 0 && br.timeInSeconds < contentDuration)
-    .map((br) => ({
-      time: br.timeInSeconds,
-      text: br.breakId || `Ad ${br.index + 1}`,
-    }));
+    .map((br) => {
+      // Find the original index of this break in the full adBreaks array
+      const originalIndex = adBreaks.findIndex(b => b.breakId === br.breakId);
+      
+      // Calculate cumulative ad duration from all previous ad breaks
+      const cumulativeAdDuration = getCumulativeAdDuration(originalIndex);
+      
+      // Adjust marker position to HLS stream time
+      const hlsTime = br.timeInSeconds + cumulativeAdDuration;
+      
+      return {
+        time: hlsTime,
+        text: br.breakId || `Ad ${originalIndex + 1}`,
+      };
+    });
   
   player.markers({
     markers,
@@ -266,419 +276,287 @@ function renderMarkerInfo() {
 }
 
 // =============================================================================
-// AD PLAYBACK CONTROL
+// AD PLAYBACK CONTROL (Legacy - kept for backwards compatibility)
 // =============================================================================
 
-/**
- * Triggers an ad break by fetching and playing the VAST ad
- * 
- * @param {Object} breakInfo - Ad break information from VMAP
- */
-function triggerAdBreak(breakInfo) {
-  console.log('[TRIGGER AD] Ad break triggered', { 
-    breakId: breakInfo.breakId, 
-    timeInSeconds: breakInfo.timeInSeconds,
-    hasCurrentAd: !!currentAd 
-  });
-  
-  // Don't trigger if already playing an ad
-  if (currentAd) {
-    console.warn('[TRIGGER AD] Already playing an ad, skipping');
-    return;
-  }
-  
-  // Mark this break as triggered
-  lastTriggeredBreakIndex = breakInfo.index;
-  const vastUrl = breakInfo.vastUrl;
-
-  console.log('[TRIGGER AD] Fetching VAST from', vastUrl);
-  
-  // Fetch and parse VAST XML
-  const vastClient = new VASTClient(0, 0);
-  vastClient
-    .get(vastUrl)
-    .then((vastResponse) => {
-      console.log('[TRIGGER AD] VAST response received', { adsCount: vastResponse.ads.length });
-      
-      // Find a valid ad with creatives
-      const validAd = vastResponse.ads.find((a) => a.creatives && a.creatives.length);
-      if (!validAd) {
-        console.warn('[TRIGGER AD] No valid ad found in VAST response');
-        return;
-      }
-      
-      // Get the linear creative (video ad)
-      const creative = getLinearCreative(validAd);
-      if (!creative) {
-        console.warn('[TRIGGER AD] No linear creative found');
-        return;
-      }
-      
-      // Get the media file URL
-      const mediaUrl = getMediaFileUrl(creative);
-      if (!mediaUrl) {
-        console.warn('[TRIGGER AD] No media URL found');
-        return;
-      }
-
-      // Extract ad properties
-      const duration = creative.duration > 0 ? creative.duration : 15;
-      const skipOffset = creative.skipDelay != null && creative.skipDelay >= 0 ? creative.skipDelay : 5;
-      
-      // Try multiple locations for clickthrough URL
-      // Different VAST parsers may store it in different places
-      let clickThrough = null;
-      
-      // Check creative level first
-      if (creative.videoClickThroughURLTemplate) {
-        clickThrough = creative.videoClickThroughURLTemplate.url || creative.videoClickThroughURLTemplate;
-      }
-      // Check ad level (some parsers store it here)
-      else if (validAd.videoClickThroughURLTemplate) {
-        clickThrough = validAd.videoClickThroughURLTemplate.url || validAd.videoClickThroughURLTemplate;
-      }
-      // Check for videoClicks object
-      else if (creative.videoClicks && creative.videoClicks.clickThroughURLTemplate) {
-        clickThrough = creative.videoClicks.clickThroughURLTemplate.url || creative.videoClicks.clickThroughURLTemplate;
-      }
-
-      console.log('[TRIGGER AD] Ad details', { 
-        mediaUrl, 
-        duration, 
-        skipOffset, 
-        hasClickThrough: !!clickThrough,
-        clickThroughUrl: clickThrough,
-        // Debug info to help find where it is
-        creativeProps: Object.keys(creative),
-        hasVideoClicks: !!creative.videoClicks,
-        adProps: Object.keys(validAd)
-      });
-      
-      if (!clickThrough) {
-        console.warn('[TRIGGER AD] ⚠️ No clickThrough URL found in VAST creative. "Learn More" button will not work.');
-        console.log('[TRIGGER AD] Check your VAST XML for <VideoClicks><ClickThrough> tag');
-        console.log('[TRIGGER AD] Debug - Creative object:', creative);
-        console.log('[TRIGGER AD] Debug - Ad object:', validAd);
-      }
-
-      // Store current ad information
-      currentAd = {
-        breakInfo,
-        ad: validAd,
-        creative,
-        duration,
-        skipOffset,
-        clickThrough,
-        mediaUrl,
-        startContentTime: breakInfo.timeInSeconds,
-      };
-
-      // Initialize VAST tracker for analytics
-      vastTracker = new VASTTracker(null, validAd, creative);
-      vastTracker.trackImpression();
-
-      // Show ad overlay UI
-      showAdOverlay();
-      adPlaybackStartTime = 0;
-
-      // Pause content and switch to ad
-      console.log('[TRIGGER AD] Pausing content and loading ad');
-      player.pause();
-      
-      // Temporarily remove content timeupdate listener to prevent false triggers
-      player.off('timeupdate', handleContentTimeUpdate);
-      
-      contentSource = player.currentSource();
-      player.src({ src: mediaUrl, type: 'video/mp4' });
-      
-      // Play ad when ready
-      player.one('canplay', () => {
-        if (!vastTracker || !currentAd) {
-          console.warn('[TRIGGER AD] Ad was cleaned up before canplay event');
-          return;
-        }
-        console.log('[TRIGGER AD] Ad ready to play');
-        vastTracker.load();
-        
-        // Set up ad event listeners AFTER the ad is ready to avoid stale timeupdate events
-        player.one('ended', onAdEnded);
-        player.on('timeupdate', onAdTimeUpdate);
-        
-        player.play()
-          .then(() => console.log('[TRIGGER AD] Ad playback started'))
-          .catch((err) => console.error('[TRIGGER AD] Failed to play ad', err));
-      });
-    })
-    .catch((err) => {
-      console.error('[TRIGGER AD] VAST error', err);
-      lastTriggeredBreakIndex = -1;
-    });
-}
-
-/**
- * Handles time updates during ad playback
- * Updates UI and checks if ad is complete
- */
-function onAdTimeUpdate() {
-  if (!currentAd || !player || !vastTracker) {
-    // State was cleared, stop processing
-    return;
-  }
-  
-  const elapsed = player.currentTime();
-  adPlaybackStartTime = elapsed;
-  
-  // Track progress for VAST analytics
-  vastTracker.setProgress(elapsed);
-  
-  // Update skip button UI
-  updateAdUI(elapsed, currentAd.duration, currentAd.skipOffset);
-
-  // Check if ad duration reached
-  if (elapsed >= currentAd.duration) {
-    console.log('[AD TIME UPDATE] Ad duration reached, completing ad');
-    vastTracker.complete();
-    cleanupAdAndResume(false);
-  }
-}
-
-/**
- * Handles the ad video 'ended' event
- */
-function onAdEnded() {
-  console.log('[AD ENDED] Ad video ended event fired');
-  
-  if (!currentAd) {
-    console.warn('[AD ENDED] No current ad');
-    return;
-  }
-  
-  if (vastTracker) {
-    console.log('[AD ENDED] Tracking completion');
-    vastTracker.complete();
-  }
-  
-  cleanupAdAndResume(false);
-}
-
-/**
- * Cleans up ad state and resumes content playback
- * 
- * @param {boolean} wasSkipped - Whether the ad was skipped by the user
- */
-function cleanupAdAndResume(wasSkipped = false) {
-  console.log('[AD CLEANUP] Starting cleanup', { wasSkipped, hasCurrentAd: !!currentAd });
-  
-  if (!currentAd) {
-    console.warn('[AD CLEANUP] No current ad to cleanup');
-    return;
-  }
-
-  // Store values before clearing state
-  const startContentTime = currentAd.startContentTime;
-  const adDuration = currentAd.duration;
-  const adId = currentAd.breakInfo?.breakId || 'unknown';
-  
-  console.log('[AD CLEANUP] Ad details', { adId, startContentTime, adDuration, wasSkipped });
-  
-  // Remove event listeners to prevent further ad operations
-  player.off('timeupdate', onAdTimeUpdate);
-  player.off('ended', onAdEnded);
-  
-  // Track skip or completion for VAST analytics
-  if (wasSkipped && vastTracker) {
-    console.log('[AD CLEANUP] Tracking skip event');
-    vastTracker.skip();
-  } else if (vastTracker) {
-    console.log('[AD CLEANUP] Ad completed normally');
-  }
-  
-  // Clear state immediately to prevent race conditions
-  currentAd = null;
-  vastTracker = null;
-  
-  // Hide ad overlay
-  hideAdOverlay();
-  
-  // Resume content playback
-  console.log('[AD CLEANUP] Resuming content playback');
-  seekContentPastAd(startContentTime, adDuration);
-}
+// NOTE: Old client-side ad functions removed for MediaTailor:
+// - triggerAdBreak() - MediaTailor handles ad playback server-side
+// - onAdTimeUpdate() - Replaced by updateAdProgress() in MediaTailor section
+// - onAdEnded() - Not needed, detectAdPlayback() monitors time
+// - cleanupAdAndResume() - Replaced by endAdBreak() in MediaTailor section
+// - seekContentPastAd() - Not needed, single HLS stream (no source switching)
+//
+// New ad detection is done via detectAdPlayback() which monitors currentTime against VMAP schedule
 
 /**
  * Skips the current ad (called when user clicks skip button)
+ * For MediaTailor: seeks forward in the stream instead of source switching
  */
 function skipAd() {
   console.log('[SKIP AD] Skip button clicked', { 
-    hasCurrentAd: !!currentAd, 
+    hasCurrentAd: !!currentAd,
+    hasCurrentAdBreak: !!currentAdBreak,
     hasTracker: !!vastTracker,
     hasPlayer: !!player,
     playerTime: player ? player.currentTime() : 'N/A'
   });
   
-  if (!currentAd) {
-    console.warn('[SKIP AD] Cannot skip - no current ad');
+  // For old client-side ads (if currentAd exists)
+  if (currentAd && !currentAdBreak) {
+    console.warn('[SKIP AD] Using old client-side skip logic');
+    if (!player) {
+      console.error('[SKIP AD] Cannot skip - no player');
+      return;
+    }
+    player.pause();
+    cleanupAdAndResume(true);
     return;
   }
   
-  if (!player) {
-    console.error('[SKIP AD] Cannot skip - no player');
+  // For MediaTailor server-stitched ads
+  if (!currentAdBreak || !player) {
+    console.warn('[SKIP AD] Cannot skip - no active ad break');
     return;
   }
   
-  // Immediately pause to stop ad playback
-  console.log('[SKIP AD] Pausing ad playback immediately');
-  player.pause();
+  // Calculate cumulative ad duration from all previous ad breaks
+  const breakIndex = adBreaks.findIndex(b => b.breakId === currentAdBreak.breakId);
+  const cumulativeAdDuration = getCumulativeAdDuration(breakIndex);
   
-  // Clean up and resume content
-  cleanupAdAndResume(true);
+  // Adjust end time to HLS stream time (content time + cumulative ads + current ad)
+  const adDuration = currentAdBreak.duration || 30; // Use actual duration from VAST
+  const endTime = currentAdBreak.timeInSeconds + cumulativeAdDuration + adDuration;
+  
+  console.log('[SKIP AD] Skipping to HLS time', { 
+    contentTime: currentAdBreak.timeInSeconds,
+    cumulativeAds: cumulativeAdDuration,
+    adDuration,
+    hlsEndTime: endTime 
+  });
+  
+  // Track skip event
+  if (vastTracker) {
+    vastTracker.skip();
+  }
+  
+  // Seek to end of ad break (stays in same stream)
+  player.currentTime(endTime);
+  
+  // detectAdPlayback() will handle cleanup
 }
 
 /**
  * Handles ad click-through (when user clicks "Learn More")
  */
 function clickAd() {
-  if (!currentAd || !vastTracker) {
-    console.warn('[CLICK AD] Cannot click - missing ad or tracker');
+  // Support both old client-side ads and new MediaTailor ads
+  const adInfo = currentAdBreak || currentAd;
+  
+  if (!adInfo) {
+    console.warn('[CLICK AD] No active ad');
     return;
   }
   
   console.log('[CLICK AD] Processing click', {
-    hasClickThrough: !!currentAd.clickThrough,
-    clickThroughUrl: currentAd.clickThrough,
-    adId: currentAd.breakInfo?.breakId
+    hasClickThrough: !!adInfo.clickThrough,
+    clickThroughUrl: adInfo.clickThrough,
+    adId: adInfo.breakId || adInfo.breakInfo?.breakId
   });
   
   // Track click event with VAST tracker
-  vastTracker.once('clickthrough', (url) => {
-    console.log('[CLICK AD] VAST tracker returned clickthrough URL:', url);
-    if (url) {
-      window.open(url, '_blank');
-    }
-  });
-  vastTracker.click();
+  if (vastTracker) {
+    vastTracker.once('clickthrough', (url) => {
+      console.log('[CLICK AD] VAST tracker returned clickthrough URL:', url);
+      if (url) {
+        window.open(url, '_blank');
+      }
+    });
+    vastTracker.click();
+  }
   
   // Open click-through URL if available in our stored data
-  if (currentAd.clickThrough) {
-    console.log('[CLICK AD] Opening stored clickThrough URL:', currentAd.clickThrough);
-    window.open(currentAd.clickThrough, '_blank');
+  if (adInfo.clickThrough) {
+    console.log('[CLICK AD] Opening stored clickThrough URL:', adInfo.clickThrough);
+    window.open(adInfo.clickThrough, '_blank');
   } else {
     console.warn('[CLICK AD] ⚠️ No click-through URL available in VAST creative');
     console.log('[CLICK AD] This means your VAST XML is missing <ClickThrough> tag');
   }
 }
 
+// CONTENT PLAYBACK CONTROL section removed - no source switching needed for MediaTailor
+// Single HLS stream contains both content and ads
+
 // =============================================================================
-// CONTENT PLAYBACK CONTROL
+// MEDIATAILOR AD DETECTION AND TRACKING
 // =============================================================================
 
 /**
- * Seeks content video past the ad break and resumes playback
- * 
- * @param {number} adStartTime - Time when ad break started (seconds)
- * @param {number} adDuration - Duration of the ad (seconds)
+ * Calculate cumulative ad duration up to a specific ad break index
+ * Uses actual durations from VAST when available, defaults to 30s
+ * @param {number} upToIndex - Calculate cumulative duration up to (but not including) this index
+ * @returns {number} Total duration in seconds
  */
-function seekContentPastAd(adStartTime, adDuration) {
-  if (!player) {
-    console.error('[SEEK CONTENT] No player available');
-    return;
+function getCumulativeAdDuration(upToIndex) {
+  let total = 0;
+  for (let i = 0; i < upToIndex && i < adBreaks.length; i++) {
+    total += adBreaks[i].duration || 30; // Use actual duration or default to 30s
   }
-  
-  // Calculate where to resume (slightly past the ad break point)
-  const seekTo = Math.min(adStartTime + adDuration + 0.5, contentDuration);
-  
-  console.log('[SEEK CONTENT] Switching back to content', { 
-    adStartTime, 
-    adDuration, 
-    seekTo,
-    contentDuration,
-    currentSource: player.currentSource()
-  });
-  
-  // Pause immediately
-  player.pause();
-  
-  // Validate content source
-  if (!contentSource || !contentSource.src) {
-    console.error('[SEEK CONTENT] No content source available!');
-    return;
-  }
-  
-  // Switch back to content source
-  player.src(contentSource);
-  
-  // Wait for content to load, then seek and play
-  player.one('loadedmetadata', () => {
-    console.log('[SEEK CONTENT] Content loaded, seeking to', seekTo);
-    player.currentTime(seekTo);
-    
-    player.play()
-      .then(() => {
-        console.log('[SEEK CONTENT] Content playback resumed successfully');
-        // Re-enable content timeupdate listener after seek completes
-        player.on('timeupdate', handleContentTimeUpdate);
-      })
-      .catch((err) => {
-        console.error('[SEEK CONTENT] Failed to resume content playback', err);
-        // Re-enable even on error to maintain functionality
-        player.on('timeupdate', handleContentTimeUpdate);
-      });
-  });
-  
-  // Handle loading errors
-  player.one('error', (e) => {
-    console.error('[SEEK CONTENT] Error loading content', e);
-    // Re-enable content timeupdate listener even on error
-    player.on('timeupdate', handleContentTimeUpdate);
-  });
+  return total;
 }
 
 /**
- * Monitors content playback and triggers ad breaks at appropriate times
+ * Monitors playback time against VMAP ad schedule
+ * Shows/hides overlay when entering/exiting ad breaks
+ * (For MediaTailor server-stitched ads)
  */
-function handleContentTimeUpdate() {
-  // Don't trigger ads if one is already playing
-  if (currentAd) return;
+function detectAdPlayback() {
+  if (!player || adBreaks.length === 0) return;
   
-  const t = player.currentTime();
+  const hlsTime = player.currentTime();
   
-  // Extra safety: ignore if current source is not the content (i.e., it's an ad)
-  const currentSrc = player.currentSource();
-  if (!contentSource || !currentSrc || currentSrc.src !== contentSource.src) {
+  // Find if we're currently in an ad break
+  // Need to account for MediaTailor ad stitching: each ad shifts the timeline
+  const activeBreak = adBreaks.find((br, index) => {
+    const adDuration = br.duration || 30; // Use actual duration from VAST or default to 30s
+    
+    // Calculate cumulative ad duration from all previous ad breaks
+    const cumulativeAdDuration = getCumulativeAdDuration(index);
+    
+    // Adjust the break time by adding cumulative ad duration
+    // This converts content time to HLS stream time
+    const startTime = br.timeInSeconds + cumulativeAdDuration;
+    const endTime = startTime + adDuration;
+    
+    return hlsTime >= startTime && hlsTime < endTime;
+  });
+  
+  if (activeBreak && !isInAdBreak) {
+    // Entering ad break
+    startAdBreak(activeBreak);
+  } else if (!activeBreak && isInAdBreak) {
+    // Exiting ad break
+    endAdBreak();
+  } else if (activeBreak && isInAdBreak && currentAdBreak) {
+    // During ad break - update UI
+    // Calculate adjusted start time accounting for previous ads
+    const breakIndex = adBreaks.findIndex(b => b.breakId === currentAdBreak.breakId);
+    const cumulativeAdDuration = getCumulativeAdDuration(breakIndex);
+    const adjustedStartTime = currentAdBreak.timeInSeconds + cumulativeAdDuration;
+    const elapsed = hlsTime - adjustedStartTime;
+    updateAdProgress(elapsed);
+  }
+}
+
+/**
+ * Called when entering an ad break
+ * Initializes UI overlay and VAST tracking
+ */
+function startAdBreak(breakInfo) {
+  console.log('[AD START] Entering ad break', breakInfo.breakId);
+  
+  isInAdBreak = true;
+  currentAdBreak = breakInfo;
+  
+  // Show overlay
+  showAdOverlay();
+  
+  // Initialize VAST tracking (for pixels, not playback)
+  initializeAdTracking(breakInfo);
+}
+
+/**
+ * Called when exiting an ad break
+ * Completes tracking and hides UI overlay
+ */
+function endAdBreak() {
+  console.log('[AD END] Exiting ad break');
+  
+  // Complete tracking
+  if (vastTracker) {
+    vastTracker.complete();
+    vastTracker = null;
+  }
+  
+  isInAdBreak = false;
+  currentAdBreak = null;
+  
+  // Hide overlay
+  hideAdOverlay();
+}
+
+/**
+ * Updates UI and tracking during ad playback
+ * @param {number} elapsed - Seconds elapsed in current ad
+ */
+function updateAdProgress(elapsed) {
+  if (!currentAdBreak) return;
+  
+  const duration = currentAdBreak.duration || 30; // Use actual duration from VAST
+  const skipOffset = currentAdBreak.skipOffset || 5; // Use actual skip offset from VAST
+  
+  // Update skip button UI
+  updateAdUI(elapsed, duration, skipOffset);
+  
+  // Track quartiles
+  if (vastTracker) {
+    vastTracker.setProgress(elapsed);
+  }
+}
+
+/**
+ * Initialize VAST tracking for server-stitched ad
+ * MediaTailor plays the ad - we just fire tracking pixels
+ * @param {Object} breakInfo - Ad break information from VMAP
+ */
+async function initializeAdTracking(breakInfo) {
+  const vastUrl = breakInfo.vastUrl;
+  
+  if (!vastUrl) {
+    console.warn('[TRACKING] No VAST URL available');
     return;
   }
   
-  // Check each ad break
-  for (let i = 0; i < adBreaks.length; i++) {
-    const br = adBreaks[i];
+  try {
+    const vastClient = new VASTClient(0, 0);
+    const vastResponse = await vastClient.get(vastUrl);
     
-    // Skip if already triggered
-    if (lastTriggeredBreakIndex === i) continue;
+    const validAd = vastResponse.ads.find(a => a.creatives && a.creatives.length);
+    if (!validAd) return;
     
-    // Pre-roll ad (at start)
-    if (br.timeInSeconds <= 0) {
-      if (t < AD_TRIGGER_TOLERANCE) {
-        console.log('[CONTENT TIME] Triggering pre-roll ad at', t);
-        triggerAdBreak(br);
-        return;
-      }
-    } 
-    // Post-roll ad (at end)
-    else if (br.timeInSeconds >= contentDuration - AD_TRIGGER_TOLERANCE) {
-      if (t >= contentDuration - AD_TRIGGER_TOLERANCE) {
-        console.log('[CONTENT TIME] Triggering post-roll ad at', t);
-        triggerAdBreak(br);
-        return;
-      }
-    } 
-    // Mid-roll ad (during playback)
-    else if (Math.abs(t - br.timeInSeconds) <= AD_TRIGGER_TOLERANCE) {
-      console.log('[CONTENT TIME] Triggering mid-roll ad at', t, 'for break at', br.timeInSeconds);
-      triggerAdBreak(br);
-      return;
+    const creative = getLinearCreative(validAd);
+    if (!creative) return;
+    
+    // Store ad metadata from VAST
+    if (creative.videoClickThroughURLTemplate) {
+      currentAdBreak.clickThrough = creative.videoClickThroughURLTemplate.url || creative.videoClickThroughURLTemplate;
     }
+    
+    // Store duration and skip offset from VAST
+    currentAdBreak.duration = creative.duration || 30; // Default to 30s if not available
+    currentAdBreak.skipOffset = creative.skipDelay || 5; // Default to 5s if not available
+    
+    // Update the adBreaks array with actual duration for this break
+    const breakIndex = adBreaks.findIndex(b => b.breakId === breakInfo.breakId);
+    if (breakIndex !== -1) {
+      adBreaks[breakIndex].duration = currentAdBreak.duration;
+      adBreaks[breakIndex].skipOffset = currentAdBreak.skipOffset;
+    }
+    
+    // Create tracker (MediaTailor plays the video, we just track)
+    vastTracker = new VASTTracker(null, validAd, creative);
+    vastTracker.trackImpression();
+    
+    console.log('[TRACKING] VAST tracker initialized', { 
+      duration: currentAdBreak.duration, 
+      skipOffset: currentAdBreak.skipOffset 
+    });
+  } catch (err) {
+    console.error('[TRACKING] Failed to initialize VAST tracker', err);
   }
 }
+
+// handleContentTimeUpdate() removed - replaced by detectAdPlayback() for MediaTailor
 
 // =============================================================================
 // INITIALIZATION AND SETUP
@@ -686,6 +564,7 @@ function handleContentTimeUpdate() {
 
 /**
  * Main initialization function - loads video and VMAP
+ * For MediaTailor: loads HLS stream and fetches VMAP for ad schedule
  */
 function loadVideoAndVMAP() {
   // Get form values
@@ -694,16 +573,16 @@ function loadVideoAndVMAP() {
   const vmapBaseUrl = document.getElementById('vmapBaseUrl').value.trim().replace(/\/$/, '');
   const userId = document.getElementById('userId').value.trim() || 'guest';
 
-  console.log('[LOAD VIDEO] Loading video and VMAP', { 
+  console.log('[LOAD VIDEO] Loading MediaTailor stream and VMAP', { 
     contentUrl, 
     duration: durationInput, 
     vmapBaseUrl, 
     userId 
   });
 
-  // Validate content URL
+  // Validate MediaTailor URL
   if (!contentUrl) {
-    alert('Enter content video URL');
+    alert('Enter MediaTailor HLS URL');
     return;
   }
 
@@ -716,24 +595,30 @@ function loadVideoAndVMAP() {
     player = null;
   }
 
-  // Create new Video.js player
+  // Create new Video.js player with HLS support
   console.log('[LOAD VIDEO] Creating new player');
   player = videojs('videoPlayer', {
     controls: true,
     preload: 'auto',
     responsive: true,
     fluid: true,
+    html5: {
+      vhs: {
+        overrideNative: true  // Use Video.js HLS implementation
+      }
+    }
   });
 
   // Reset state
-  lastTriggeredBreakIndex = -1;
   adBreaks = [];
+  isInAdBreak = false;
+  currentAdBreak = null;
 
-  // Fetch and parse VMAP
+  // Fetch VMAP (same one MediaTailor uses)
   fetchAndParseVMAP(vmapBaseUrl, contentDuration, userId)
     .then((vmap) => {
       adBreaks = buildAdBreakList(vmap, contentDuration);
-      console.log('[LOAD VIDEO] Ad breaks loaded', { 
+      console.log('[LOAD VIDEO] Ad breaks loaded from VMAP', { 
         count: adBreaks.length, 
         breaks: adBreaks.map(b => ({ id: b.breakId, time: b.timeInSeconds })) 
       });
@@ -747,13 +632,13 @@ function loadVideoAndVMAP() {
       document.getElementById('markerInfo').textContent = `VMAP error: ${err.message}`;
     });
 
-  // Load content video
-  player.src({ src: contentUrl, type: 'video/mp4' });
-  contentSource = { src: contentUrl, type: 'video/mp4' };
+  // Load MediaTailor HLS stream (pre-stitched with ads)
+  player.src({ src: contentUrl, type: 'application/x-mpegURL' });
+  contentSource = { src: contentUrl, type: 'application/x-mpegURL' };
 
-  // Start monitoring for ad breaks
-  console.log('[LOAD VIDEO] Content source set, adding timeupdate listener');
-  player.on('timeupdate', handleContentTimeUpdate);
+  // Monitor playback for ad detection
+  console.log('[LOAD VIDEO] Adding ad detection listener');
+  player.on('timeupdate', detectAdPlayback);
 }
 
 // =============================================================================
@@ -770,11 +655,13 @@ document.getElementById('loadBtn').addEventListener('click', loadVideoAndVMAP);
  */
 document.getElementById('skipBtn').addEventListener('click', () => {
   console.log('[SKIP BUTTON] Skip button clicked', { 
+    hasCurrentAdBreak: !!currentAdBreak,
     hasCurrentAd: !!currentAd,
     buttonDisabled: document.getElementById('skipBtn').disabled 
   });
   
-  if (!currentAd) {
+  // Support both MediaTailor (currentAdBreak) and old client-side (currentAd)
+  if (!currentAdBreak && !currentAd) {
     console.warn('[SKIP BUTTON] No current ad to skip');
     return;
   }
@@ -786,9 +673,13 @@ document.getElementById('skipBtn').addEventListener('click', () => {
  * Learn More button - opens ad click-through URL
  */
 document.getElementById('learnMoreBtn').addEventListener('click', () => {
-  console.log('[LEARN MORE] Learn more button clicked', { hasCurrentAd: !!currentAd });
+  console.log('[LEARN MORE] Learn more button clicked', { 
+    hasCurrentAdBreak: !!currentAdBreak,
+    hasCurrentAd: !!currentAd 
+  });
   
-  if (!currentAd) {
+  // Support both MediaTailor (currentAdBreak) and old client-side (currentAd)
+  if (!currentAdBreak && !currentAd) {
     console.warn('[LEARN MORE] No current ad');
     return;
   }
