@@ -14,8 +14,8 @@
 
     <div class="control-panel">
       <div class="control-group">
-        <label>Content video URL:</label>
-        <input type="text" id="contentVideoUrl" placeholder="https://example.com/content.mp4"
+        <label>MediaTailor HLS URL (.m3u8):</label>
+        <input type="text" id="contentVideoUrl" placeholder="https://xxx.mediatailor.amazonaws.com/.../video.m3u8"
           value="https://92b089bed21a438fa0d53ec27bd64462.mediatailor.us-east-1.amazonaws.com/v1/master/a665f5ddf2f56c330e11d5bcee6110f53edee9d6/demo_mt_0004/video.m3u8">
       </div>
       <div class="control-group">
@@ -23,7 +23,7 @@
         <input type="number" id="contentDuration" value="2551" min="1">
       </div>
       <div class="control-group">
-        <label>VMAP base URL:</label>
+        <label>VMAP base URL (for ad schedule):</label>
         <input type="text" id="vmapBaseUrl" placeholder="https://api-turnstr.augmentmybiz.com/vmap"
           value="https://api-turnstr.augmentmybiz.com/vmap">
       </div>
@@ -32,7 +32,7 @@
         <input type="text" id="userId" value="guest">
       </div>
       <div class="button-row">
-        <button type="button" id="loadBtn">Load video &amp; VMAP</button>
+        <button type="button" id="loadBtn">Load MediaTailor stream</button>
       </div>
     </div>
 
@@ -51,6 +51,10 @@
     <div class="info-panel">
       <h3>Ad break markers</h3>
       <div id="markerInfo">Load video to see ad break times from VMAP.</div>
+      <p style="font-size: 0.9em; color: #666; margin-top: 8px;">
+        Ads are server-stitched by MediaTailor into the HLS stream. 
+        The VMAP tells us when ads play so we can show controls.
+      </p>
     </div>
   </div>
 
